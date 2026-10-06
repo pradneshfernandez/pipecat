@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import base64
 import json
 from dataclasses import fields
@@ -21,6 +22,7 @@ pytest.importorskip("sarvamai")
 import pipecat.processors.frameworks.rtvi.models as RTVI
 from pipecat.frames.frames import (
     ErrorFrame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     MetricsFrame,
     ProposedUserStartedSpeakingFrame,
@@ -1352,6 +1354,148 @@ async def test_legacy_sdk_carries_keyterms_on_every_connection(monkeypatch, keyt
         assert query["model"] == ["saaras:v4"]
         assert query["sample_rate"] == ["16000"]
     assert all(h["User-Agent"] == sdk_headers()["User-Agent"] for h in headers)
+
+
+class _OpenWebsocket(_FakeWebsocket):
+    """Stays open after its messages run out, like a live socket."""
+
+    async def _iter_messages(self):
+        for message in self._messages:
+            yield message
+        await asyncio.Event().wait()
+
+
+def _capture_sdk_connections(monkeypatch) -> list[dict[str, list[str]]]:
+    """Record the query parameters of every connection the SDK opens."""
+    from contextlib import asynccontextmanager
+
+    queries = []
+
+    @asynccontextmanager
+    async def fake_connect(url, **kwargs):
+        queries.append(parse_qs(urlparse(url).query))
+        yield _OpenWebsocket()
+
+    monkeypatch.setattr(
+        "sarvamai.speech_to_text_streaming.client.websockets_client_connect", fake_connect
+    )
+    return queries
+
+
+@pytest.mark.parametrize(
+    "delta, param, value",
+    [
+        (SarvamSTTService.Settings(model="saaras:v3"), "model", "saaras:v3"),
+        (SarvamSTTService.Settings(high_vad_sensitivity=True), "high_vad_sensitivity", "true"),
+        (SarvamSTTService.Settings(vad_signals=True), "vad_signals", "true"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_connection_param_update_reconnects(monkeypatch, delta, param, value):
+    """Fields sent when the socket opens take effect by reconnecting."""
+    queries = _capture_sdk_connections(monkeypatch)
+    service = SarvamSTTService(api_key="test-key", sample_rate=16000)
+    await service.setup(frame_processor_setup(TaskManager()))
+    try:
+        await service._update_settings(delta)
+        assert len(queries) == 2
+        assert queries[1][param] == [value]
+    finally:
+        await service._disconnect()
+        await service.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_model_update_switches_model_config(monkeypatch):
+    _capture_sdk_connections(monkeypatch)
+    service = SarvamSTTService(api_key="test-key", sample_rate=16000)
+    await service.setup(frame_processor_setup(TaskManager()))
+    try:
+        await service._update_settings(SarvamSTTService.Settings(model="saaras:v3"))
+        assert service._config is MODEL_CONFIGS["saaras:v3"]
+    finally:
+        await service._disconnect()
+        await service.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_model_update_is_ignored(monkeypatch):
+    queries = _capture_sdk_connections(monkeypatch)
+    service = SarvamSTTService(api_key="test-key", sample_rate=16000)
+    await service.setup(frame_processor_setup(TaskManager()))
+    try:
+        changed = await service._update_settings(SarvamSTTService.Settings(model="saaras:v2.5"))
+        assert "model" not in changed
+        assert service._settings.model == "saaras:v4"
+        assert len(queries) == 1
+        # A later reconnect still opens the supported model.
+        await service._disconnect()
+        await service._connect()
+        assert queries[-1]["model"] == ["saaras:v4"]
+    finally:
+        await service._disconnect()
+        await service.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_settings_update_while_user_speaks_reconnects_after_turn(monkeypatch):
+    queries = _capture_sdk_connections(monkeypatch)
+    service = SarvamSTTService(api_key="test-key", sample_rate=16000)
+    await service.setup(frame_processor_setup(TaskManager()))
+    try:
+        service._can_reconnect = False  # the user is speaking
+        await service._update_settings(SarvamSTTService.Settings(language=Language.HI_IN))
+        assert len(queries) == 1
+        await service._maybe_reconnect_on_user_stopped_speaking()
+        assert len(queries) == 2
+        assert queries[1]["language-code"] == ["hi-IN"]
+    finally:
+        await service._disconnect()
+        await service.cleanup()
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [
+        SarvamSTTService.Settings(language=Language.HI_IN),
+        SarvamSTTService.Settings(model="saaras:v3"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_audio_during_settings_reconnect_reaches_new_connection(monkeypatch, delta):
+    from contextlib import asynccontextmanager
+
+    sockets = []
+    reconnecting = asyncio.Event()
+    handshake = asyncio.Event()
+
+    @asynccontextmanager
+    async def fake_connect(url, **kwargs):
+        if sockets:
+            reconnecting.set()
+            await handshake.wait()
+        websocket = _OpenWebsocket()
+        sockets.append(websocket)
+        yield websocket
+
+    monkeypatch.setattr(
+        "sarvamai.speech_to_text_streaming.client.websockets_client_connect", fake_connect
+    )
+    service = SarvamSTTService(api_key="test-key", sample_rate=16000)
+    await service.setup(frame_processor_setup(TaskManager()))
+    try:
+        update = asyncio.create_task(service._update_settings(delta))
+        await asyncio.wait_for(reconnecting.wait(), timeout=1)
+        audio = InputAudioRawFrame(audio=b"\x00\x00" * 800, sample_rate=16000, num_channels=1)
+        await service.process_audio_frame(audio, FrameDirection.DOWNSTREAM)
+        handshake.set()
+        await update
+        assert len(sockets) == 2
+        assert not sockets[0].sent
+        assert sockets[1].sent
+    finally:
+        await service._disconnect()
+        await service.cleanup()
 
 
 @pytest.mark.asyncio
