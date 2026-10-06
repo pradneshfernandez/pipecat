@@ -488,14 +488,26 @@ class SarvamSTTService(STTService):
             "num_initial_ignored_frames",
         }
         if changed.keys() & reconnect_fields:
-            await self._disconnect()
-            await self._connect()
+            await self._request_reconnect()
 
         unhandled = {k: v for k, v in changed.items() if k not in reconnect_fields}
         if unhandled:
             self._warn_unhandled_updated_settings(unhandled)
 
         return changed
+
+    async def _do_reconnect(self):
+        """Disconnect and reconnect to Sarvam.
+
+        Called by ``STTService._reconnect()`` inside the reconnecting guard.
+
+        Raises:
+            ConnectionError: If the service could not reconnect.
+        """
+        await self._disconnect()
+        await self._connect()
+        if not self._socket_client:
+            raise ConnectionError(f"{self} could not reconnect to Sarvam")
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the service and connect.
