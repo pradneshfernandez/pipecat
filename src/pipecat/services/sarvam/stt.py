@@ -452,7 +452,11 @@ class SarvamSTTService(STTService):
                     await self._socket_client.flush()
 
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
-        """Apply a settings delta, validate, sync state, and reconnect.
+        """Apply a settings delta and reconnect if anything changed.
+
+        Sarvam reads every setting from the connection's query parameters, so a
+        change is applied by reconnecting, which waits until the user stops
+        speaking. An unsupported model is ignored.
 
         Args:
             delta: A :class:`STTSettings` (or ``SarvamSTTService.Settings``) delta.
@@ -473,26 +477,17 @@ class SarvamSTTService(STTService):
 
         changed = await super()._update_settings(delta)
 
-        # These are all WebSocket connect-time parameters; reconnect to apply.
-        reconnect_fields = {
-            "language",
-            "positive_speech_threshold",
-            "negative_speech_threshold",
-            "min_speech_frames",
-            "first_turn_min_speech_frames",
-            "negative_frames_count",
-            "negative_frames_window",
-            "start_speech_volume_threshold",
-            "interrupt_min_speech_frames",
-            "pre_speech_pad_frames",
-            "num_initial_ignored_frames",
-        }
-        if changed.keys() & reconnect_fields:
-            await self._request_reconnect()
+        if "model" in changed:
+            config = MODEL_CONFIGS.get(assert_given(self._settings.model) or "")
+            if config is None:
+                logger.warning(f"Unsupported model '{self._settings.model}', ignoring")
+                self._settings.model = changed.pop("model")
+                self._sync_model_name_to_metrics()
+            else:
+                self._config = config
 
-        unhandled = {k: v for k, v in changed.items() if k not in reconnect_fields}
-        if unhandled:
-            self._warn_unhandled_updated_settings(unhandled)
+        if changed:
+            await self._request_reconnect()
 
         return changed
 
